@@ -1,14 +1,15 @@
 
 import json
+import threading
 from pathlib import Path
 
+import av
 import cv2
 import numpy as np
-import pandas as pd
 import streamlit as st
 import tensorflow as tf
-from PIL import Image
 
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
 from src.preprocessing import preprocess_face
 
 
@@ -17,7 +18,7 @@ from src.preprocessing import preprocess_face
 # ==========================================
 
 st.set_page_config(
-    page_title="Facial Emotion Recognition",
+    page_title="Real-Time Facial Emotion Recognition",
     page_icon="😊",
     layout="wide"
 )
@@ -25,8 +26,8 @@ st.set_page_config(
 st.title("😊 Real-Time Facial Emotion Recognition")
 
 st.caption(
-    "Deep Learning based facial expression recognition "
-    "using the FER-2013 dataset."
+    "Live facial emotion detection using CNN, "
+    "OpenCV and the FER-2013 dataset."
 )
 
 st.divider()
@@ -44,7 +45,7 @@ DEFAULT_CLASSES = [
 ]
 
 if not MODEL_PATH.exists():
-    st.error("Trained model not found in the models folder.")
+    st.error("Trained model not found.")
     st.stop()
 
 
@@ -72,11 +73,6 @@ def load_detector():
 model = load_model()
 detector = load_detector()
 
-
-# ==========================================
-# 3. LOAD EMOTION CLASSES
-# ==========================================
-
 class_file = MODEL_PATH.parent / "class_names.json"
 
 if class_file.exists():
@@ -85,263 +81,217 @@ else:
     classes = DEFAULT_CLASSES
 
 if len(classes) != 7:
-    st.error("Model must have seven emotion classes.")
+    st.error("Expected seven emotion classes.")
     st.stop()
 
 
 # ==========================================
-# 4. IMAGE UPLOAD AND CAMERA
+# 3. LIVE VIDEO PROCESSOR
 # ==========================================
 
-st.header("Upload or Capture Face Image")
+class EmotionProcessor:
 
-col1, col2 = st.columns(2)
+    def __init__(self):
+        self.lock = threading.Lock()
 
-with col1:
-    uploaded = st.file_uploader(
-        "Upload Image",
-        type=["jpg", "jpeg", "png"]
-    )
+    def recv(self, frame):
 
-with col2:
-    camera_image = st.camera_input(
-        "Capture Using Camera"
-    )
-
-source = uploaded if uploaded is not None else camera_image
-
-
-# ==========================================
-# 5. FACE DETECTION
-# ==========================================
-
-if source is not None:
-
-    try:
-
-        image = Image.open(source).convert("RGB")
-
-        rgb = np.array(image)
-
-        bgr = cv2.cvtColor(
-            rgb,
-            cv2.COLOR_RGB2BGR
-        )
+        img = frame.to_ndarray(format="bgr24")
 
         gray = cv2.cvtColor(
-            bgr,
+            img,
             cv2.COLOR_BGR2GRAY
         )
 
-        # Improve image contrast for detection
         gray = cv2.equalizeHist(gray)
 
-        # Stricter face detection settings
         faces = detector.detectMultiScale(
             gray,
             scaleFactor=1.1,
             minNeighbors=7,
-            minSize=(80, 80),
+            minSize=(70, 70),
             flags=cv2.CASCADE_SCALE_IMAGE
         )
 
-        preview = bgr.copy()
+        for (x, y, w, h) in faces:
 
-        if len(faces) == 0:
+            face = img[y:y+h, x:x+w]
 
-            st.warning(
-                "No face detected. Please upload a clear, "
-                "front-facing image with good lighting."
-            )
-
-        else:
-
-            st.success(
-                f"Successfully detected {len(faces)} face(s)."
-            )
-
-            results = []
-
-            # ==========================================
-            # 6. PREDICT EACH DETECTED FACE
-            # ==========================================
-
-            for number, (x, y, w, h) in enumerate(
-                faces, start=1
-            ):
-
-                face = bgr[y:y+h, x:x+w]
-
+            try:
                 processed_face = preprocess_face(face)
 
-                probabilities = model.predict(
-                    processed_face,
-                    verbose=0
-                )[0]
+                with self.lock:
+                    probabilities = model.predict(
+                        processed_face,
+                        verbose=0
+                    )[0]
 
                 index = int(np.argmax(probabilities))
 
                 emotion = classes[index].title()
 
-                confidence = (
-                    float(probabilities[index]) * 100
+                confidence = float(
+                    probabilities[index] * 100
                 )
 
-                results.append({
-                    "number": number,
-                    "emotion": emotion,
-                    "confidence": confidence,
-                    "probabilities": probabilities,
-                    "face": face
-                })
+                label = f"{emotion}: {confidence:.1f}%"
 
                 # Draw face rectangle
                 cv2.rectangle(
-                    preview,
+                    img,
                     (x, y),
                     (x+w, y+h),
-                    (40, 220, 90),
-                    3
+                    (0, 255, 0),
+                    2
                 )
 
-                label = f"{emotion} {confidence:.1f}%"
+                # Draw emotion label
+                cv2.rectangle(
+                    img,
+                    (x, max(0, y-35)),
+                    (x+w, y),
+                    (0, 255, 0),
+                    -1
+                )
 
                 cv2.putText(
-                    preview,
+                    img,
                     label,
-                    (x, max(30, y-10)),
+                    (x+5, y-10),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.75,
-                    (40, 220, 90),
+                    0.65,
+                    (0, 0, 0),
                     2,
                     cv2.LINE_AA
                 )
 
-            # ==========================================
-            # 7. DISPLAY DETECTED IMAGE
-            # ==========================================
-
-            st.divider()
-
-            st.header("Face Detection Result")
-
-            preview_rgb = cv2.cvtColor(
-                preview,
-                cv2.COLOR_BGR2RGB
-            )
-
-            st.image(
-                preview_rgb,
-                caption="Detected faces",
-                use_container_width=True
-            )
-
-            # ==========================================
-            # 8. DISPLAY EMOTION RESULTS
-            # ==========================================
-
-            st.divider()
-
-            st.header("Emotion Prediction Results")
-
-            for result in results:
-
-                st.subheader(
-                    f"Face {result['number']}"
+            except Exception:
+                cv2.putText(
+                    img,
+                    "Prediction error",
+                    (x, max(25, y-10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2
                 )
 
-                left, right = st.columns([1, 2])
+        # Display face count
+        cv2.putText(
+            img,
+            f"Faces detected: {len(faces)}",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 0),
+            2
+        )
 
-                with left:
-
-                    face_rgb = cv2.cvtColor(
-                        result["face"],
-                        cv2.COLOR_BGR2RGB
-                    )
-
-                    st.image(
-                        face_rgb,
-                        caption="Detected face",
-                        width=200
-                    )
-
-                with right:
-
-                    st.success(
-                        f"Predicted Emotion: {result['emotion']}"
-                    )
-
-                    st.metric(
-                        "Model Confidence",
-                        f"{result['confidence']:.2f}%"
-                    )
-
-                # ==========================================
-                # 9. ALL SEVEN EMOTION PROBABILITIES
-                # ==========================================
-
-                st.subheader(
-                    "All Seven Emotion Probabilities"
-                )
-
-                probabilities = result["probabilities"]
-
-                for name, probability in zip(
-                    classes,
-                    probabilities
-                ):
-
-                    percentage = (
-                        float(probability) * 100
-                    )
-
-                    st.write(
-                        f"{name.title()}: {percentage:.2f}%"
-                    )
-
-                    st.progress(
-                        float(probability)
-                    )
-
-                # ==========================================
-                # 10. EMOTION COMPARISON CHART
-                # ==========================================
-
-                st.subheader(
-                    "Emotion Comparison Chart"
-                )
-
-                chart_data = pd.DataFrame({
-                    "Emotion": [
-                        name.title() for name in classes
-                    ],
-                    "Probability": [
-                        float(value) for value in probabilities
-                    ]
-                })
-
-                st.bar_chart(
-                    chart_data.set_index("Emotion")
-                )
-
-                st.divider()
-
-    except Exception as error:
-
-        st.error(
-            f"Error while processing image: {error}"
+        return av.VideoFrame.from_ndarray(
+            img,
+            format="bgr24"
         )
 
 
 # ==========================================
-# 11. FOOTER
+# 4. LIVE CAMERA INTERFACE
 # ==========================================
 
+st.header("Live Camera Detection")
+
+st.write(
+    "Click START to activate your webcam. "
+    "The system will continuously detect faces "
+    "and predict their facial expressions."
+)
+
+left, right = st.columns(2)
+
+with left:
+    st.info("Camera: Live webcam")
+
+with right:
+    st.info("Model: CNN | 7 Emotion Classes")
+
+
+# ==========================================
+# 5. WEBRTC STREAM
+# ==========================================
+
+webrtc_ctx = webrtc_streamer(
+    key="facial-emotion-recognition",
+    mode=WebRtcMode.SENDRECV,
+    video_processor_factory=EmotionProcessor,
+    media_stream_constraints={
+        "video": {
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+            "frameRate": {"ideal": 15}
+        },
+        "audio": False
+    },
+    rtc_configuration={
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]}
+        ]
+    },
+    async_processing=True
+)
+
+
+# ==========================================
+# 6. EMOTION CLASS INFORMATION
+# ==========================================
+
+st.divider()
+
+st.header("Available Emotion Categories")
+
+emotion_columns = st.columns(7)
+
+emotion_icons = {
+    "angry": "😠",
+    "disgust": "🤢",
+    "fear": "😨",
+    "happy": "😊",
+    "sad": "😢",
+    "surprise": "😲",
+    "neutral": "😐"
+}
+
+for column, emotion in zip(emotion_columns, classes):
+
+    with column:
+        st.markdown(
+            f"<div style='text-align:center;'>"
+            f"<h2>{emotion_icons.get(emotion, '🙂')}</h2>"
+            f"<b>{emotion.title()}</b>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+
+# ==========================================
+# 7. PROJECT INFORMATION
+# ==========================================
+
+st.divider()
+
+st.subheader("Project Information")
+
+st.write("**Dataset:** FER-2013")
+st.write("**Model:** Convolutional Neural Network (CNN)")
+st.write("**Face Detection:** OpenCV Haar Cascade")
+st.write("**Video Streaming:** Streamlit-WebRTC")
+st.write("**Input:** Live Webcam")
+st.write("**Output:** Seven facial expression predictions")
+
 st.caption(
-    "B.Tech CSE Project | FER-2013 | CNN Deep Learning"
+    "B.Tech CSE Deep Learning Project | "
+    "Real-Time Facial Emotion Recognition"
 )
 
 st.caption(
-    "Predictions estimate visible facial expressions; "
-    "they do not establish a person's actual emotional state."
+    "Predictions estimate visible facial expressions "
+    "and do not establish a person's actual emotional state."
 )
